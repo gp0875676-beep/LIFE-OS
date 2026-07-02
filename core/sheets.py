@@ -16,7 +16,6 @@ from config import (
     SCOPES,
     SPREADSHEET_ID,
     TASKS,
-    COL_COMP_PCT,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,14 +42,9 @@ def _month_sheet(target: date) -> Optional[gspread.Worksheet]:
 
 
 def _parse_date(cell: str) -> Optional[date]:
-    """
-    Parse date from sheet column A.
-    Sheet format: '01-Jul' or '01-Jul-26' or '2026-07-01'
-    """
     cell = str(cell).strip()
     if not cell:
         return None
-
     for fmt in ("%d-%b", "%d-%b-%y", "%d-%b-%Y", "%Y-%m-%d", "%d/%m/%Y"):
         try:
             d = datetime.strptime(cell, fmt).date()
@@ -63,23 +57,23 @@ def _parse_date(cell: str) -> Optional[date]:
 
 
 def _find_row(ws: gspread.Worksheet, target: date) -> Optional[int]:
-    """Return 1-based row index for the given date. Sheet Column A has dates like '01-Jul'."""
-    col_a = ws.col_values(1)
-    for idx, cell in enumerate(col_a):
+    all_vals = ws.col_values(1)
+    for idx, cell in enumerate(all_vals):
         parsed = _parse_date(cell)
         if parsed and parsed == target:
-            return idx + 1
+            found_row = idx + 1
+            logger.info("Found date %s at row %d", target, found_row)
+            return found_row
+    logger.warning("Date %s not found. Col A sample: %s", target, all_vals[:5])
     return None
 
 
 def get_day_status(target: date) -> Optional[dict[str, Any]]:
-    """Fetch task completion status for target date."""
     ws = _month_sheet(target)
     if ws is None:
         return None
     row = _find_row(ws, target)
     if row is None:
-        logger.warning("Date %s not found in sheet.", target)
         return None
 
     row_data: list[Any] = ws.row_values(row)
@@ -106,7 +100,6 @@ def get_day_status(target: date) -> Optional[dict[str, Any]]:
 
 
 def mark_task(target: date, task_name: str, value: bool) -> bool:
-    """Set a task checkbox to value and update completion % column."""
     ws = _month_sheet(target)
     if ws is None:
         return False
@@ -121,7 +114,6 @@ def mark_task(target: date, task_name: str, value: bool) -> bool:
         return False
 
     col_letter = chr(ord("D") + task_idx)
-    comp_col = "W"
 
     try:
         ws.update_acell(f"{col_letter}{row}", str(value).upper())
@@ -136,7 +128,7 @@ def mark_task(target: date, task_name: str, value: bool) -> bool:
             in ("TRUE", "1", "YES", "✓")
         )
         pct = round((done / len(TASKS)) * 100, 1)
-        ws.update_acell(f"{comp_col}{row}", pct)
+        ws.update_acell(f"W{row}", pct)
         logger.info("Marked %s=%s on %s row=%d PCT=%.1f%%", task_name, value, target, row, pct)
         return True
     except APIError as exc:
@@ -145,7 +137,6 @@ def mark_task(target: date, task_name: str, value: bool) -> bool:
 
 
 def get_week_completion() -> float:
-    """Average completion % for past 7 days."""
     today = date.today()
     ws = _month_sheet(today)
     if ws is None:
@@ -169,7 +160,6 @@ def get_week_completion() -> float:
 
 
 def get_month_completion(target_month: Optional[int] = None) -> float:
-    """Average completion % for given month."""
     today = date.today()
     month = target_month or today.month
     target_date = today.replace(month=month, day=1)
@@ -179,7 +169,7 @@ def get_month_completion(target_month: Optional[int] = None) -> float:
 
     col_w = ws.col_values(23)
     values = []
-    for v in col_w[MONTH_DATA_START_ROW - 1:]:
+    for v in col_w[1:]:
         try:
             values.append(float(str(v).replace("%", "")))
         except (ValueError, TypeError):
@@ -188,7 +178,6 @@ def get_month_completion(target_month: Optional[int] = None) -> float:
 
 
 def get_streaks() -> dict[str, int]:
-    """Calculate current streaks for STREAK_TASKS."""
     from config import STREAK_TASKS
 
     today = date.today()
@@ -196,7 +185,7 @@ def get_streaks() -> dict[str, int]:
     if ws is None:
         return {}
 
-    col_a = ws.col_values(1)
+    col_a    = ws.col_values(1)
     all_rows = ws.get_all_values()
 
     dated_rows: list[tuple[date, list[str]]] = []
@@ -231,7 +220,6 @@ def get_streaks() -> dict[str, int]:
 
 
 def get_body_measurements() -> dict[str, str]:
-    """Return latest measurements from Body Measurements sheet."""
     try:
         ws = _open_spreadsheet().worksheet("Body Measurements")
     except Exception:
