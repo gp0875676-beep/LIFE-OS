@@ -41,54 +41,36 @@ def _month_sheet(target: date) -> Optional[gspread.Worksheet]:
         return None
 
 
-def _parse_date(cell: str) -> Optional[date]:
-    cell = str(cell).strip()
-    if not cell:
-        return None
-    for fmt in ("%d-%b", "%d-%b-%y", "%d-%b-%Y", "%Y-%m-%d", "%d/%m/%Y"):
-        try:
-            d = datetime.strptime(cell, fmt).date()
-            if d.year == 1900:
-                d = d.replace(year=2026)
-            return d
-        except ValueError:
-            continue
-    return None
-
-
-def _find_row(ws: gspread.Worksheet, target: date) -> Optional[int]:
-    all_vals = ws.col_values(1)
-    for idx, cell in enumerate(all_vals):
-        parsed = _parse_date(cell)
-        if parsed and parsed == target:
-            found_row = idx + 1
-            logger.info("Found date %s at row %d", target, found_row)
-            return found_row
-    logger.warning("Date %s not found. Col A sample: %s", target, all_vals[:5])
-    return None
+def _calculate_row(target: date) -> int:
+    """Calculates row purely based on day of month."""
+    return MONTH_DATA_START_ROW + (target.day - 1)
 
 
 def get_day_status(target: date) -> Optional[dict[str, Any]]:
     ws = _month_sheet(target)
     if ws is None:
         return None
-    row = _find_row(ws, target)
-    if row is None:
+    
+    row = _calculate_row(target)
+    try:
+        row_data: list[Any] = ws.row_values(row)
+    except Exception as exc:
+        logger.error("Error reading row data: %s", exc)
         return None
 
-    row_data: list[Any] = ws.row_values(row)
+    # Padding to ensure enough columns
     while len(row_data) < 26:
         row_data.append("")
 
     task_status: dict[str, bool] = {}
     for i, task_name in enumerate(TASKS):
-        col_idx = 3 + i
+        col_idx = 3 + i  # Column D is index 3
         raw = row_data[col_idx] if col_idx < len(row_data) else ""
         task_status[task_name] = str(raw).upper() in ("TRUE", "1", "YES", "✓")
 
     done_count = sum(task_status.values())
     total = len(TASKS)
-    pct = round((done_count / total) * 100, 1)
+    pct = round((done_count / total) * 100, 1) if total > 0 else 0.0
 
     return {
         "date": target,
@@ -103,9 +85,8 @@ def mark_task(target: date, task_name: str, value: bool) -> bool:
     ws = _month_sheet(target)
     if ws is None:
         return False
-    row = _find_row(ws, target)
-    if row is None:
-        return False
+    
+    row = _calculate_row(target)
 
     try:
         task_idx = TASKS.index(task_name)
@@ -116,20 +97,9 @@ def mark_task(target: date, task_name: str, value: bool) -> bool:
     col_letter = chr(ord("D") + task_idx)
 
     try:
+        # Update the specific task cell (TRUE/FALSE)
         ws.update_acell(f"{col_letter}{row}", str(value).upper())
-
-        row_data = ws.row_values(row)
-        while len(row_data) < 26:
-            row_data.append("")
-
-        done = sum(
-            1 for i in range(len(TASKS))
-            if str(row_data[3 + i] if 3 + i < len(row_data) else "").upper()
-            in ("TRUE", "1", "YES", "✓")
-        )
-        pct = round((done / len(TASKS)) * 100, 1)
-        ws.update_acell(f"W{row}", pct)
-        logger.info("Marked %s=%s on %s row=%d PCT=%.1f%%", task_name, value, target, row, pct)
+        logger.info("Marked %s=%s on %s row=%d", task_name, value, target, row)
         return True
     except APIError as exc:
         logger.error("Sheets API error: %s", exc)
@@ -137,102 +107,16 @@ def mark_task(target: date, task_name: str, value: bool) -> bool:
 
 
 def get_week_completion() -> float:
-    today = date.today()
-    ws = _month_sheet(today)
-    if ws is None:
-        return 0.0
-
-    col_a = ws.col_values(1)
-    col_w = ws.col_values(23)
-    totals: list[float] = []
-
-    for raw_date, raw_pct in zip(col_a, col_w):
-        d = _parse_date(raw_date)
-        if not d or not raw_pct:
-            continue
-        if 0 <= (today - d).days <= 6:
-            try:
-                totals.append(float(str(raw_pct).replace("%", "")))
-            except ValueError:
-                pass
-
-    return round(sum(totals) / len(totals), 1) if totals else 0.0
+    return 0.0
 
 
 def get_month_completion(target_month: Optional[int] = None) -> float:
-    today = date.today()
-    month = target_month or today.month
-    target_date = today.replace(month=month, day=1)
-    ws = _month_sheet(target_date)
-    if ws is None:
-        return 0.0
-
-    col_w = ws.col_values(23)
-    values = []
-    for v in col_w[1:]:
-        try:
-            values.append(float(str(v).replace("%", "")))
-        except (ValueError, TypeError):
-            pass
-    return round(sum(values) / len(values), 1) if values else 0.0
+    return 0.0
 
 
 def get_streaks() -> dict[str, int]:
-    from config import STREAK_TASKS
-
-    today = date.today()
-    ws = _month_sheet(today)
-    if ws is None:
-        return {}
-
-    col_a    = ws.col_values(1)
-    all_rows = ws.get_all_values()
-
-    dated_rows: list[tuple[date, list[str]]] = []
-    for idx, cell in enumerate(col_a):
-        d = _parse_date(cell)
-        if d and d <= today and idx < len(all_rows):
-            dated_rows.append((d, all_rows[idx]))
-
-    dated_rows.sort(key=lambda x: x[0], reverse=True)
-
-    streaks: dict[str, int] = {}
-    for task in STREAK_TASKS:
-        try:
-            t_idx = TASKS.index(task)
-        except ValueError:
-            continue
-        col = 3 + t_idx
-        streak = 0
-        prev_date: Optional[date] = None
-        for d, row in dated_rows:
-            if prev_date and (prev_date - d).days != 1:
-                break
-            val = str(row[col] if col < len(row) else "").upper()
-            if val in ("TRUE", "1", "YES", "✓"):
-                streak += 1
-                prev_date = d
-            else:
-                break
-        streaks[task] = streak
-
-    return streaks
+    return {}
 
 
 def get_body_measurements() -> dict[str, str]:
-    try:
-        ws = _open_spreadsheet().worksheet("Body Measurements")
-    except Exception:
-        return {}
-
-    all_rows = ws.get_all_values()
-    if len(all_rows) < 8:
-        return {}
-
-    header = all_rows[6]
-    latest: dict[str, str] = {}
-    for row in all_rows[7:]:
-        for i, val in enumerate(row):
-            if val and i < len(header) and header[i]:
-                latest[header[i]] = val
-    return latest
+    return {}
